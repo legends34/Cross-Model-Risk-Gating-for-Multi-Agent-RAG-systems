@@ -1,0 +1,22 @@
+# Core model + generation
+torch>=2.1.0
+transformers>=4.44.0
+accelerate>=0.33.0
+
+# Graph engine
+networkx>=3.2
+
+# Hybrid retrieval: semantic/textual similarity on top of graph structure
+sentence-transformers>=3.0.0
+
+# Dataset loading (MetaQA)
+datasets>=2.20.0
+
+# Evaluation / metrics / plotting for the paper's results section
+scipy>=1.13.0
+scikit-learn>=1.5.0
+pandas>=2.2.0
+matplotlib>=3.9.0
+
+# Utility
+tqdm>=4.66.0
