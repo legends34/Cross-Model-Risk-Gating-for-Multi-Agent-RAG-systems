@@ -29,6 +29,7 @@ Get it manually:
 --------------------------------------------------------------------
 """
 
+import re
 import os
 from collections import deque
 
@@ -92,24 +93,99 @@ def build_graph(triples: list[tuple[str, str, str]]) -> nx.MultiDiGraph:
 # ---------------------------------------------------------------------
 # Step 3a: Entity linking — find graph nodes mentioned in a query
 # ---------------------------------------------------------------------
+def _contains_word_boundary(text_lower: str, phrase_lower: str) -> bool:
+    """
+    NEW — root-cause fix after a second false positive: "Ted" matched
+    INSIDE the word "directed" using plain substring checks (not a
+    real word relationship at all, just letters that happen to appear
+    consecutively). Word-boundary regex (\\b) only matches at actual
+    word edges, so "ted" won't match inside "directed" the way plain
+    `in` would.
+    """
+    pattern = r"\b" + re.escape(phrase_lower) + r"\b"
+    return re.search(pattern, text_lower) is not None
+
+
+def _fuzzy_word_match(node: str, query_lower: str) -> bool:
+    """
+    NEW — added after a real failure: entity linking found NOTHING
+    for "John Balderston" because the actual KB node is "John L.
+    Balderston" (includes a middle initial), so exact substring
+    matching failed entirely. That caused graph traversal to return
+    nothing, forcing a fallback to semantic search, which surfaced a
+    completely unrelated fact ("Ted directed by Seth MacFarlane") —
+    confirmed as the actual cause of a bad real generation run.
+
+    This checks whether most of a node's SIGNIFICANT words (longer
+    than 2 characters, so short initials like "L." don't count)
+    appear in the query AS WHOLE WORDS, even if the full node string
+    doesn't. Tolerates a missing middle initial or minor wording
+    differences without opening the door to short, generic, or
+    inside-another-word false matches.
+    """
+    significant_words = [w.strip(".,") for w in node.split() if len(w.strip(".,")) > 2]
+    if len(significant_words) < 2:
+        return False  # too short/generic to fuzzy-match safely
+    return all(_contains_word_boundary(query_lower, w.lower()) for w in significant_words)
+
+
 def find_entities_in_query(query: str, graph: nx.MultiDiGraph) -> list[str]:
     """
     Naive but effective-enough-for-a-first-version entity linker:
-    checks which node names appear as a substring of the query
-    (case-insensitive). Sorted by length, longest first, so "The
-    Dark Knight" matches before a shorter partial match like "Dark".
+    checks which node names appear in the query as whole words
+    (case-insensitive), longest first.
 
-    This is the crudest part of the pipeline and a legitimate thing
-    to improve later (e.g. proper NER) — flagging that honestly
-    rather than pretending this is production-grade.
+    FIXED FOUR TIMES after real bugs caught in testing:
+    1. Drop shorter matches subsumed by a longer match already kept
+       (e.g. prefer "John L. Balderston" over "john" WHEN both match).
+    2. CAPITALIZATION FILTER — MetaQA's tag/genre nodes are lowercase
+       ('french', 'bd-r'), real entities are capitalized. Filters out
+       tag-node false positives even when no better NAME match exists.
+    3. FUZZY WORD MATCH — exact matching alone missed "John L.
+       Balderston" when the query said "John Balderston" (no middle
+       initial), which caused a real bad generation (wrong fact
+       injected 27 times, model degenerated into repeating "Sethrow").
+    4. WORD-BOUNDARY MATCHING (root-cause fix) — plain substring
+       checks matched "Ted" INSIDE the word "directed", a false
+       positive with no whole-word relationship to the query at all.
+       Switched both checks to regex word boundaries — fixes this
+       whole CLASS of bug rather than patching individual instances.
     """
     query_lower = query.lower()
-    matches = [
+    raw_matches = [
         node for node in graph.nodes
-        if isinstance(node, str) and node.lower() in query_lower
+        if isinstance(node, str) and _contains_word_boundary(query_lower, node.lower())
     ]
-    matches.sort(key=len, reverse=True)
-    return matches
+
+    # Fuzzy pass: catch nodes that don't exactly match but whose
+    # significant words are all present in the query as whole words.
+    fuzzy_matches = [
+        node for node in graph.nodes
+        if isinstance(node, str) and node not in raw_matches and _fuzzy_word_match(node, query_lower)
+    ]
+
+    all_matches = raw_matches + fuzzy_matches
+    all_matches.sort(key=len, reverse=True)
+
+    # Fix #2: only keep matches that look like proper nouns (contain
+    # an uppercase letter). CORRECTED after testing: an earlier
+    # version of this fell back to ALL matches (including lowercase
+    # tags) when no capitalized match existed — which silently
+    # reintroduced the exact bug being fixed. Zero graph-linked
+    # entities is NOT a failure case here: HybridGraphRetriever
+    # already falls back to semantic search on its own, so there's
+    # no need to force a bad match just to return something.
+    candidates = [m for m in all_matches if any(c.isupper() for c in m)]
+
+    # Fix #1: drop matches subsumed by a longer match already kept
+    kept = []
+    for candidate in candidates:
+        candidate_lower = candidate.lower()
+        if any(candidate_lower in already.lower() for already in kept):
+            continue
+        kept.append(candidate)
+
+    return kept
 
 
 # ---------------------------------------------------------------------
@@ -182,7 +258,7 @@ class SemanticIndex:
 
     def search(self, query: str, top_k: int = 5) -> list[tuple[str, str, str]]:
         query_embedding = self.model.encode(query, convert_to_tensor=True)
-        hits = util.semantic_search(query_embedding, self.embeddings, top_k=top_k)[0]  # remove this during testing , for parallel computing.
+        hits = util.semantic_search(query_embedding, self.embeddings, top_k=top_k)[0]
         return [self.triples[hit["corpus_id"]] for hit in hits]
 
 
