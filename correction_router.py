@@ -119,13 +119,28 @@ def full_reverification(model, tokenizer, original_query: str) -> str:
     simplified stand-in for "cross-agent consensus" noted in the
     module docstring — a genuine second opinion, just not from a
     literal second cooperating agent (yet).
+
+    FIXED after a real observed failure: with no system prompt and
+    temperature=0.7, this produced a spurious safety-refusal on a
+    completely benign movie-trivia question — a known quirk of
+    smaller instruct models being miscalibrated on refusals,
+    especially under sampling. Added a light system prompt anchoring
+    the context (trivia Q&A, not an open-ended chat) and lowered
+    temperature — still samples (so it's a genuinely independent
+    second attempt, not identical to greedy Stage 1), just less
+    erratically. This reduces the ODDS of a repeat, doesn't
+    guarantee it never happens again — small models can still
+    misfire occasionally, worth monitoring if it recurs.
     """
-    messages = [{"role": "user", "content": original_query}]
+    messages = [
+        {"role": "system", "content": "You answer short, factual trivia questions about movies directly and concisely."},
+        {"role": "user", "content": original_query},
+    ]
     prompt_text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
     inputs = tokenizer(prompt_text, return_tensors="pt").to(model.device)
 
     with torch.no_grad():
-        output_ids = model.generate(**inputs, max_new_tokens=64, do_sample=True, temperature=0.7, pad_token_id=tokenizer.eos_token_id)
+        output_ids = model.generate(**inputs, max_new_tokens=64, do_sample=True, temperature=0.4, pad_token_id=tokenizer.eos_token_id)
     return tokenizer.decode(output_ids[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True)
 
 
