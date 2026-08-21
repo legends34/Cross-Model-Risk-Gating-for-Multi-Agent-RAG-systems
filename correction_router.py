@@ -1,281 +1,245 @@
 """
-graph_engine.py
-The "Graph Engine" half of the dual-engine system.
-
-Responsibilities:
-  1. Load MetaQA's knowledge graph (a set of subject-relation-object
-     triples) into an in-memory graph structure.
-  2. Given a query, find relevant facts two ways:
-       a) Graph traversal — find entities mentioned in the query,
-          walk outward from them along edges (this is what makes
-          multi-hop questions answerable, and is the core reason
-          we're using a graph instead of plain text retrieval).
-       b) Semantic similarity — embed the query and every triple,
-          and rank by cosine similarity. This is the fallback for
-          when entity matching in (a) fails, or when the phrasing
-          doesn't map cleanly onto a graph edge.
-  3. Combine both into one hybrid retriever, since we decided a
-     hybrid (not graph-only, not text-only) is the strongest design.
+correction_router.py
+Layers 4-6 of the Cross-Modal Conformal Risk Gating design:
+  - Layer 4: Propose-then-verify correction (for "local_fix" claims)
+  - Layer 5: Escalation (surgical rollback, then full re-verification
+    as a last resort)
+  - Layer 6: Provenance propagation (tagging every claim with how it
+    was handled, for downstream trust-weighting)
 
 --------------------------------------------------------------------
-SETUP — MetaQA isn't on pip/HuggingFace as a clean one-line download.
-Get it manually:
-  1. Clone/download from https://github.com/yuyuz/MetaQA
-  2. You need: kb.txt  (the knowledge graph triples)
-  3. Place it at:  data/metaqa/kb.txt
-  4. kb.txt format is pipe-separated, one triple per line, e.g.:
-       Kismet|directed_by|Andrew Marton
-       Kismet|written_by|John Balderston
+IMPORTANT DISTINCTION FROM attention_injector.py — read this first:
+
+This file's corrections happen AFTER generation is complete, at the
+CLAIM level (post-hoc text editing on extracted facts). This is a
+DIFFERENT correction pathway from attention_injector.py's live
+KV-cache injection, which happens DURING generation, at the TOKEN
+level. Your original dual-engine pitch used the token-level
+approach; this report's design uses the claim-level approach. Both
+are legitimate — they intervene at different points and different
+granularities, and your team should discuss which one is the actual
+target for the paper (or whether to compare both as an ablation,
+which would itself make an interesting experiment).
+--------------------------------------------------------------------
+
+HONEST SIMPLIFICATION: the report's Layer 5 "cross-agent consensus
+check" assumes multiple cooperating agents genuinely disagreeing
+(that's Aarna's original multi-agent framework). This codebase
+doesn't yet implement real multi-agent orchestration, so
+full_reverification() below is a simplified stand-in: a full,
+independent regeneration of the answer, rather than a genuine
+multi-agent consensus vote. Worth flagging explicitly to the team
+rather than quietly pretending this is the "real" thing.
 --------------------------------------------------------------------
 """
 
-import os
-from collections import deque
+import torch
 
-import networkx as nx
-from sentence_transformers import SentenceTransformer, util
-
-from config import DEVICE
+from claim_extractor import _parse_triples, triple_to_sentence
+from dual_scorer import score_claim
 
 
 # ---------------------------------------------------------------------
-# Step 1: Load raw triples from MetaQA's kb.txt
+# Layer 4: Propose-then-verify correction (GraphCorrect pattern)
 # ---------------------------------------------------------------------
-def load_triples(kb_path: str) -> list[tuple[str, str, str]]:
+def propose_correction(model, tokenizer, claim_sentence: str, evidence: str) -> tuple:
     """
-    Reads MetaQA's kb.txt and returns a list of (subject, relation, object)
-    triples. Raises a clear error if the file is missing, instead of a
-    confusing downstream crash.
-    """
-    if not os.path.exists(kb_path):
-        raise FileNotFoundError(
-            f"Couldn't find {kb_path}. Download MetaQA's kb.txt from "
-            f"https://github.com/yuyuz/MetaQA and place it at this path."
-        )
+    Two-pass correction, as specified in the report:
+      Pass 1: given the evidence, what SHOULD the claim say?
+      Pass 2: splice that correction back in as natural, readable text.
 
-    triples = []
-    with open(kb_path, "r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            parts = line.split("|")
-            if len(parts) != 3:
-                continue  # skip malformed lines rather than crashing
-            subj, rel, obj = parts
-            triples.append((subj.strip(), rel.strip(), obj.strip()))
-    return triples
+    Returns (corrected_triple, corrected_sentence). Either may be
+    None if the model's output couldn't be parsed — callers must
+    handle that (treat as a failed local fix, fall through to escalation).
+    """
+    # --- Pass 1: derive the corrected fact from evidence ---
+    pass1_prompt = (
+        f"Evidence: {evidence}\n"
+        f"Original (possibly incorrect) claim: {claim_sentence}\n"
+        f"Based ONLY on the evidence above, state the corrected fact "
+        f"as a single line: subject|relation|object"
+    )
+    messages = [{"role": "user", "content": pass1_prompt}]
+    prompt_text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    inputs = tokenizer(prompt_text, return_tensors="pt").to(model.device)
+
+    with torch.no_grad():
+        output_ids = model.generate(**inputs, max_new_tokens=40, do_sample=False, pad_token_id=tokenizer.eos_token_id)
+    raw_output = tokenizer.decode(output_ids[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True)
+
+    # Reusing claim_extractor's parser (an internal/private helper,
+    # imported directly since this stays within the same project —
+    # noting this rather than pretending it's a fully public API).
+    parsed = _parse_triples(raw_output)
+    if not parsed:
+        return None, None
+
+    corrected_triple = parsed[0]
+    corrected_sentence = triple_to_sentence(corrected_triple)
+    return corrected_triple, corrected_sentence
+
+
+def verify_correction(model, tokenizer, entailment_scorer, gate, context, corrected_triple, retrieved_facts) -> dict:
+    """
+    "Re-score the corrected claim before accepting it — correction is
+    never accepted on the first pass alone." Runs the corrected claim
+    back through the SAME dual-scoring + gating pipeline used for the
+    original claim, and only counts the fix as successful if the gate
+    now says "accept".
+    """
+    rescored = score_claim(model, tokenizer, entailment_scorer, context, corrected_triple, retrieved_facts)
+    decision = gate.decide(rescored["p"], rescored)
+    return {"rescored": rescored, "decision": decision, "success": decision["route"] == "accept"}
 
 
 # ---------------------------------------------------------------------
-# Step 2: Build a NetworkX graph from those triples
+# Layer 5: Escalation
 # ---------------------------------------------------------------------
-def build_graph(triples: list[tuple[str, str, str]]) -> nx.MultiDiGraph:
+def surgical_rollback(model, tokenizer, retriever, claim_sentence: str, original_query: str) -> list:
     """
-    Builds a directed multigraph (multiple edges between the same two
-    nodes are allowed, since e.g. a movie can have multiple writers).
-
-    We add BOTH the forward edge (subject -> object) and a reverse
-    edge (object -> subject) labeled with an "_inverse" relation.
-    This matters because MetaQA questions are phrased in both
-    directions — e.g. "who directed X" (forward) vs "what did
-    director Y direct" (reverse) — and a directed-only graph would
-    miss half of these during traversal.
+    Cheaper escalation attempt before a full re-run: try a WIDER
+    retrieval (more hops, more semantic candidates) specifically for
+    this one claim, in case the original retrieval simply didn't
+    look hard enough. Only if this still comes up empty does the
+    caller move to full_reverification.
     """
-    graph = nx.MultiDiGraph()
-    for subj, rel, obj in triples:
-        graph.add_edge(subj, obj, relation=rel)
-        graph.add_edge(obj, subj, relation=f"{rel}_inverse")
-    return graph
+    wider_retriever_query = f"{original_query} {claim_sentence}"
+    # Reuses the existing retriever's semantic search directly with a
+    # larger top_k for this one-off wider attempt, rather than
+    # permanently changing the retriever's default settings.
+    facts = retriever.semantic_index.search(wider_retriever_query, top_k=10)
+    fact_sentences = [triple_to_sentence(t) for t in facts]
+    return fact_sentences
 
 
-# ---------------------------------------------------------------------
-# Step 3a: Entity linking — find graph nodes mentioned in a query
-# ---------------------------------------------------------------------
-def find_entities_in_query(query: str, graph: nx.MultiDiGraph) -> list[str]:
+def full_reverification(model, tokenizer, original_query: str) -> str:
     """
-    Naive but effective-enough-for-a-first-version entity linker:
-    checks which node names appear as a substring of the query
-    (case-insensitive), longest first.
+    Last resort: independently regenerate an answer to the original
+    query from scratch, with no special conditioning. This is the
+    simplified stand-in for "cross-agent consensus" noted in the
+    module docstring — a genuine second opinion, just not from a
+    literal second cooperating agent (yet).
 
-    FIXED TWICE after real bugs caught in testing:
-    1. Drop shorter matches subsumed by a longer match already kept
-       (e.g. prefer "John L. Balderston" over "john" WHEN both match).
-    2. CAPITALIZATION FILTER — added after fix #1 alone didn't help a
-       real test case. When the query's wording doesn't exactly match
-       an entity's full name in the graph (e.g. query says "John
-       Balderston", but the real node is "John L. Balderston"), there
-       may be NO longer match to subsume "john" — fix #1 has nothing
-       to work with. But a real, exploitable pattern showed up in
-       actual test output: MetaQA's tag/genre nodes are lowercase
-       ('french', 'bd-r', 'prison'), while real entities (movies,
-       people) are properly capitalized ('A Man Escaped', 'Robert
-       Bresson'). Filtering to capitalized-only matches (when any
-       exist) excludes tag-node false positives even when no better
-       NAME match is available.
+    FIXED after a real observed failure: with no system prompt and
+    temperature=0.7, this produced a spurious safety-refusal on a
+    completely benign movie-trivia question — a known quirk of
+    smaller instruct models being miscalibrated on refusals,
+    especially under sampling. Added a light system prompt anchoring
+    the context (trivia Q&A, not an open-ended chat) and lowered
+    temperature — still samples (so it's a genuinely independent
+    second attempt, not identical to greedy Stage 1), just less
+    erratically. This reduces the ODDS of a repeat, doesn't
+    guarantee it never happens again — small models can still
+    misfire occasionally, worth monitoring if it recurs.
     """
-    query_lower = query.lower()
-    raw_matches = [
-        node for node in graph.nodes
-        if isinstance(node, str) and node.lower() in query_lower
+    messages = [
+        {"role": "system", "content": "You answer short, factual trivia questions about movies directly and concisely."},
+        {"role": "user", "content": original_query},
     ]
-    raw_matches.sort(key=len, reverse=True)
+    prompt_text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    inputs = tokenizer(prompt_text, return_tensors="pt").to(model.device)
 
-    # Fix #2: only keep matches that look like proper nouns (contain
-    # an uppercase letter). CORRECTED after testing: an earlier
-    # version of this fell back to ALL matches (including lowercase
-    # tags) when no capitalized match existed — which silently
-    # reintroduced the exact bug being fixed. Zero graph-linked
-    # entities is NOT a failure case here: HybridGraphRetriever
-    # already falls back to semantic search on its own, so there's
-    # no need to force a bad match just to return something.
-    candidates = [m for m in raw_matches if any(c.isupper() for c in m)]
-
-    # Fix #1: drop matches subsumed by a longer match already kept
-    kept = []
-    for candidate in candidates:
-        candidate_lower = candidate.lower()
-        if any(candidate_lower in already.lower() for already in kept):
-            continue
-        kept.append(candidate)
-
-    return kept
+    with torch.no_grad():
+        output_ids = model.generate(**inputs, max_new_tokens=64, do_sample=True, temperature=0.4, pad_token_id=tokenizer.eos_token_id)
+    return tokenizer.decode(output_ids[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True)
 
 
 # ---------------------------------------------------------------------
-# Step 3b: Graph traversal — walk outward from seed entities
+# The full router — ties Layers 4, 5, and 6 together per claim
 # ---------------------------------------------------------------------
-def traverse_graph(
-    graph: nx.MultiDiGraph,
-    seed_entities: list[str],
-    max_hops: int = 2,
-) -> list[tuple[str, str, str]]:
+def route_claim(
+    model,
+    tokenizer,
+    retriever,
+    entailment_scorer,
+    gate,
+    scored_claim: dict,
+    context: str,
+    original_query: str,
+) -> dict:
     """
-    Breadth-first traversal starting from each seed entity, up to
-    max_hops edges away. Returns the triples encountered along the
-    way. This is what makes multi-hop questions answerable — e.g.
-    "capital of the country that signed a deal with Japan" needs
-    2 hops, not 1.
+    Given one already-scored claim (from dual_scorer.score_claim) and
+    the gate's decision, executes the full correction/escalation flow
+    and returns a provenance-tagged result — this is what gets passed
+    to whichever agent or step consumes the claim next (Layer 6).
     """
-    visited_edges = set()
-    result_triples = []
+    decision = gate.decide(scored_claim["p"], scored_claim)
+    provenance = {
+        "claim": scored_claim["claim"],
+        "original_sentence": scored_claim["claim_sentence"],
+        "fused_risk": decision["fused_risk"],
+        "lambda_used": decision["lambda_used"],
+    }
 
-    for seed in seed_entities:
-        if seed not in graph:
-            continue
-        frontier = deque([(seed, 0)])
-        visited_nodes = {seed}
+    # --- accept: leave untouched ---
+    if decision["route"] == "accept":
+        provenance.update({"final_sentence": scored_claim["claim_sentence"], "status": "agreement"})
+        # Agreement between independent sources IS free labeled data,
+        # per the report — feed it to calibration immediately, no
+        # need to wait for external ground truth on this one.
+        if scored_claim["k_verdict"] == "entailment":
+            gate.record_resolution("accept", was_actually_wrong=False)
+        return provenance
 
-        while frontier:
-            node, depth = frontier.popleft()
-            if depth >= max_hops:
-                continue
-            for neighbor in graph.successors(node):
-                edge_data = graph.get_edge_data(node, neighbor)
-                for _, data in edge_data.items():
-                    relation = data["relation"]
-                    edge_key = (node, relation, neighbor)
-                    if edge_key not in visited_edges:
-                        visited_edges.add(edge_key)
-                        result_triples.append(edge_key)
-                if neighbor not in visited_nodes:
-                    visited_nodes.add(neighbor)
-                    frontier.append((neighbor, depth + 1))
-
-    return result_triples
-
-
-# ---------------------------------------------------------------------
-# Step 4: Semantic similarity fallback
-# ---------------------------------------------------------------------
-class SemanticIndex:
-    """
-    Embeds every triple as a short natural-language sentence and
-    supports similarity search against a query. This is the fallback
-    for when entity linking misses (e.g. a misspelling, an alias,
-    or phrasing that doesn't literally contain a node's name).
-    """
-
-    def __init__(self, triples: list[tuple[str, str, str]], model_name: str = "all-MiniLM-L6-v2"):
-        self.triples = triples
-        self.model = SentenceTransformer(model_name, device=DEVICE)
-        self.sentences = [self._triple_to_sentence(t) for t in triples]
-        self.embeddings = self.model.encode(
-            self.sentences, convert_to_tensor=True, show_progress_bar=True
+    # --- local_fix: propose-then-verify ---
+    if decision["route"] == "local_fix":
+        evidence = scored_claim["k_evidence"] or ""
+        corrected_triple, corrected_sentence = propose_correction(
+            model, tokenizer, scored_claim["claim_sentence"], evidence
         )
 
-    @staticmethod
-    def _triple_to_sentence(triple: tuple[str, str, str]) -> str:
-        subj, rel, obj = triple
-        readable_rel = rel.replace("_", " ")
-        return f"{subj} {readable_rel} {obj}"
+        if corrected_triple is not None:
+            retrieved_facts = [evidence] if evidence else []
+            verification = verify_correction(
+                model, tokenizer, entailment_scorer, gate, context, corrected_triple, retrieved_facts
+            )
+            if verification["success"]:
+                provenance.update({"final_sentence": corrected_sentence, "status": "corrected"})
+                return provenance
+        # Correction proposed but failed re-verification (or couldn't
+        # be parsed at all) — fall through to escalation rather than
+        # silently keeping an unverified "fix".
 
-    def search(self, query: str, top_k: int = 5) -> list[tuple[str, str, str]]:
-        query_embedding = self.model.encode(query, convert_to_tensor=True)
-        hits = util.semantic_search(query_embedding, self.embeddings, top_k=top_k)[0]
-        return [self.triples[hit["corpus_id"]] for hit in hits]
+    # --- escalate: surgical rollback, then full re-verification ---
+    wider_facts = surgical_rollback(model, tokenizer, retriever, scored_claim["claim_sentence"], original_query)
+    if wider_facts:
+        rescored = score_claim(model, tokenizer, entailment_scorer, context, scored_claim["claim"], wider_facts)
+        redecision = gate.decide(rescored["p"], rescored)
+        if redecision["route"] == "accept":
+            provenance.update({"final_sentence": scored_claim["claim_sentence"], "status": "escalated_resolved"})
+            return provenance
 
-
-# ---------------------------------------------------------------------
-# Step 5: The combined hybrid retriever
-# ---------------------------------------------------------------------
-class HybridGraphRetriever:
-    """
-    Combines graph traversal + semantic similarity. Graph traversal
-    is tried first (it's cheap and precise when entity linking
-    succeeds); semantic search fills in when traversal comes up
-    empty, or is added alongside as extra candidates.
-
-    Returns results tagged with their source ("graph" or "semantic")
-    so that evaluate.py can later run ablations — e.g. "how much
-    worse is graph-only, or semantic-only, than the hybrid?" — which
-    is exactly the kind of experiment a reviewer will want to see.
-    """
-
-    def __init__(self, kb_path: str, max_hops: int = 2, semantic_top_k: int = 5):
-        self.triples = load_triples(kb_path)
-        self.graph = build_graph(self.triples)
-        self.semantic_index = SemanticIndex(self.triples)
-        self.max_hops = max_hops
-        self.semantic_top_k = semantic_top_k
-
-    def retrieve(self, query: str) -> list[dict]:
-        results = []
-
-        seed_entities = find_entities_in_query(query, self.graph)
-        graph_triples = traverse_graph(self.graph, seed_entities, self.max_hops)
-        for t in graph_triples:
-            results.append({"triple": t, "source": "graph"})
-
-        semantic_triples = self.semantic_index.search(query, self.semantic_top_k)
-        existing = {r["triple"] for r in results}
-        for t in semantic_triples:
-            if t not in existing:
-                results.append({"triple": t, "source": "semantic"})
-
-        return results
-
-    def retrieve_as_facts(self, query: str) -> list[str]:
-        """Convenience method: returns plain-text fact strings, ready
-        to be injected into the text engine's context or KV cache."""
-        return [
-            SemanticIndex._triple_to_sentence(r["triple"])
-            for r in self.retrieve(query)
-        ]
+    # Last resort — full independent regeneration
+    reverified_answer = full_reverification(model, tokenizer, original_query)
+    provenance.update({"final_sentence": reverified_answer, "status": "escalated_unresolved"})
+    return provenance
 
 
 # ---------------------------------------------------------------------
-# Quick manual test — run this file directly to sanity-check things
+# Quick manual test — needs the full model + retriever + NLI scorer,
+# so this is a genuine integration test, not a lightweight unit test.
 # ---------------------------------------------------------------------
 if __name__ == "__main__":
-    KB_PATH = "data/metaqa/kb.txt"
+    from attention_injector import load_model_and_tokenizer
+    from graph_engine import HybridGraphRetriever
+    from dual_scorer import EntailmentScorer
+    from risk_gate import RiskGate
 
-    retriever = HybridGraphRetriever(KB_PATH, max_hops=2)
+    print("Loading model, retriever, NLI scorer, gate...")
+    model, tokenizer = load_model_and_tokenizer()
+    retriever = HybridGraphRetriever("data/metaqa/kb.txt", max_hops=2)
+    entailment_scorer = EntailmentScorer()
+    gate = RiskGate()
 
-    test_query = "who directed the movie written by John Balderston"
-    facts = retriever.retrieve(test_query)
+    query = "Who directed the movie written by John Balderston?"
+    context = f"Question: {query}"
 
-    print(f"Query: {test_query}")
-    print(f"Found {len(facts)} facts:")
-    for f in facts[:10]:
-        print(f"  [{f['source']}] {f['triple']}")
+    # Deliberately wrong claim, to exercise the local_fix path
+    wrong_claim = ("Kismet", "directed_by", "William Dieterle")
+    retrieved_facts = retriever.retrieve_as_facts(query)
+
+    scored = score_claim(model, tokenizer, entailment_scorer, context, wrong_claim, retrieved_facts)
+    print(f"\nInitial score: {scored}")
+
+    result = route_claim(model, tokenizer, retriever, entailment_scorer, gate, scored, context, query)
+    print(f"\nRouting result: {result}")
