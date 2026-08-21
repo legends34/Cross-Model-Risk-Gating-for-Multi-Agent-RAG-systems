@@ -169,17 +169,17 @@ class FrozenThreshold(AdaptiveThreshold):
 
 
 def estimate_pipeline_cost(result: dict) -> int:
-    """
-    Approximates generation-call cost from a pipeline result's claim
-    statuses. See the module docstring's caveat — this is a proxy,
-    not measured wall-clock time or token counts.
-    """
-    cost = 1  # the initial draft generation
+    cost = 1  # initial draft generation
+    if result.get("stage1_used"):
+        # Each Stage 1 intervention (attention_injector.py's KV-cache
+        # correction) is an extra generation step — count them so
+        # Stage 1 isn't scored as free relative to Stage 2.
+        cost += len(result.get("stage1_interventions", []))
     for claim in result.get("claims", []):
         if claim["status"] == "corrected":
-            cost += 2  # propose_correction + verify_correction's rescoring
+            cost += 2
         elif claim["status"] in ("escalated_resolved", "escalated_unresolved"):
-            cost += 3  # propose attempt + surgical rollback rescoring + full re-verification
+            cost += 3
     return cost
 
 
@@ -200,9 +200,11 @@ def run_evaluation(pipeline: CrossModalRAGPipeline, questions: list[dict]) -> pd
             "no_intervention": lambda: run_no_intervention(pipeline.model, pipeline.tokenizer, query),
             "whole_rerun": lambda: run_whole_rerun(pipeline.model, pipeline.tokenizer, query),
             "self_consistency": lambda: run_self_consistency(pipeline.model, pipeline.tokenizer, query),
-            "full_pipeline_aci": lambda: pipeline.answer(query),
-        }
-
+            "stage1_only":  lambda: pipeline.answer(query, use_stage1=True,  use_stage2=False),
+            "stage2_only":  lambda: pipeline.answer(query, use_stage1=False, use_stage2=True),
+            "both_stages":  lambda: pipeline.answer(query, use_stage1=True,  use_stage2=True),
+            "neither_stage": lambda: pipeline.answer(query, use_stage1=False, use_stage2=False),
+}
         for method_name, method_fn in methods.items():
             start = time.time()
             result = method_fn()
