@@ -23,8 +23,19 @@ MODEL_NAME = "Qwen/Qwen2.5-1.5B-Instruct"
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
-# Use fp16 on GPU to save memory; fp32 on CPU (fp16 is unstable on CPU)
-TORCH_DTYPE = torch.float16 if DEVICE == "cuda" else torch.float32
+# FIXED after a real bug caught in Colab testing: fp16 + eager
+# attention (eager is REQUIRED for attention_injector.py's hooks)
+# produced NaN logits — confirmed directly by a CUDA assertion
+# ("probability tensor contains nan") during generation. Eager
+# attention computes raw scores without the numerically-stabilized
+# fused kernels that faster backends use, and fp16's limited range
+# overflows easily. Switched to fp32 for correctness — a 1.5B model
+# fits comfortably in fp32 on a T4's 16GB VRAM, just somewhat slower
+# than fp16 would have been. If you later profile this as too slow,
+# bfloat16 is worth trying (wider range than fp16, avoids this
+# specific overflow issue) — but verify T4's bf16 support first,
+# it's not hardware-accelerated on Turing-generation GPUs like T4.
+TORCH_DTYPE = torch.float32
 
 # Max new tokens to generate per answer. Kept short since MetaQA
 # answers are typically factual, single-entity answers, not essays.
